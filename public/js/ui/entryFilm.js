@@ -4,8 +4,10 @@
 // official files: r 0.988 / 0.998, nothing else is in it). A fresh page may not play sound before a user gesture, so a
 // black 点击进入 card waits for the tap that unlocks it (audio.js listens for the same gesture), then the film runs.
 // Volumes / mute are the settings' (sfx · bgm channels); the player's own lobby music (audio.setLobbyTrack) plays in
-// place of the official track as everywhere else. A tap / click / key skips; never over a restored match; phones wait
-// for landscape; reduced motion and a server without the art pack get no film (the title screen shows at once).
+// place of the official track as everywhere else, untouched by the film. A tap / click / key skips; phones wait for
+// landscape; reduced motion and a server without the art pack get no film (the title screen shows at once). Never over
+// a room or a match: the route is watched from the card on, and a session restored into a room / a match while the card
+// waits or the film runs takes the overlay down at once, silences the cue and hands the music back to that screen.
 // main.js calls playEntryFilm once at boot.
 import { store, selectRoute } from '../store.js';
 import { audio, resolveBgm } from '../audio.js';
@@ -67,27 +69,33 @@ async function prepareSound() {
 /**
  * Hold the screen's music for the opening: the playing track fades out and every playBgm meanwhile is only remembered;
  * the release starts the remembered (else the last) track from its top — audio.js's own start, fade-in included.
- * Null when the music is silent or the player's own lobby music plays (nothing to hold).
+ * Null when the music is silent or the player's own lobby music is set (audio.setLobbyTrack → audio.lobbyTrack): that
+ * one keeps playing on — no fade, playBgm left alone.
+ * @param {any} [a] the audio manager (tests pass a stand-in)
+ * @returns {(() => void) | null} the release
  */
-function holdBgm() {
-  if (!audio.ctx || audio.bgmSilent || Object.prototype.hasOwnProperty.call(audio, 'playBgm')) return null;
-  try { if (audio.lobbyMusicOverride?.('lobby')) return null; } catch { return null; }
+export function holdBgm(a = audio) {
+  if (!a.ctx || a.bgmSilent || a.lobbyTrack || Object.prototype.hasOwnProperty.call(a, 'playBgm')) return null;
   let asked;
-  audio.playBgm = (key) => { asked = key; };
-  try { ++audio.bgmToken; audio._fadeOutBgm(null, 0.4); } catch { /* ignore */ }
+  a.playBgm = (key) => { asked = key; };
+  try { ++a.bgmToken; a._fadeOutBgm(null, 0.4); } catch { /* ignore */ }
   let held = true;
   return () => {
     if (!held) return;
     held = false;
-    delete audio.playBgm;
-    try { audio.playBgm(asked !== undefined ? asked : audio.lastBgmKey ?? 'lobby'); } catch { /* ignore */ }
+    delete a.playBgm;
+    try { a.playBgm(asked !== undefined ? asked : a.lastBgmKey ?? 'lobby'); } catch { /* ignore */ }
   };
 }
 
 let playing = false;
 
-function run() {
-  if (playing) return;
+/**
+ * @param {() => boolean} allowed  false once the film must go (a room / a match, the caller's skip)
+ * @param {(host: HTMLElement) => { render: (t: number) => void, grain: () => void, destroy: () => void }} mount
+ */
+function run(allowed, mount) {
+  if (playing || !allowed()) return;
   playing = true;
   if (!document.getElementById('spa-entry-style')) {
     const st = document.createElement('style');
@@ -103,7 +111,7 @@ function run() {
   el.firstChild.textContent = t('点击跳过');
   const locked = !(audio.ctx && audio.ctx.state === 'running');
   const skipLabel = el.querySelector('.spa-entry__skip');
-  let gate = Promise.resolve();
+  let gate = Promise.resolve(), gateKey = null;
   if (locked) {
     skipLabel.style.opacity = '0';
     const card = document.createElement('div');
@@ -122,6 +130,7 @@ function run() {
         const wait = () => (audio.ctx?.state === 'running' || performance.now() > until ? resolve() : setTimeout(wait, 30));
         setTimeout(wait, 0);
       };
+      gateKey = go;
       el.addEventListener('pointerdown', go, { once: true });
       addEventListener('keydown', go, true);
     });
@@ -137,13 +146,23 @@ function run() {
     el.remove();
     playing = false;
   };
-  const finish = (skipped) => {
+  /** 'end' (the film ran out), 'skip' (a tap / key) or 'leave' (the route left the title / lobby) */
+  const finish = (how) => {
     if (done) return;
     done = true;
+    unwatch();
     clearTimeout(bgmTimer);
-    release?.();
     removeEventListener('keydown', onKey, true);
-    if (skipped) {
+    if (gateKey) removeEventListener('keydown', gateKey, true);
+    if (how === 'leave') {
+      // a restored room / match: nothing of the film may sit over it or be heard in it
+      try { src?.node.stop(0); src?.gain.disconnect(); } catch { /* ignore */ }
+      release?.(); // the music goes back to audio.js, which plays the new screen's track
+      cleanup();
+      return;
+    }
+    release?.();
+    if (how === 'skip') {
       // a skip: the cue stops with the picture (the music starts now, from its top)
       try { const t = audio.ctx.currentTime; src?.gain.gain.setTargetAtTime(0, t, 0.08); src?.node.stop(t + 0.5); } catch { /* ignore */ }
       el.style.transition = 'opacity .3s ease';
@@ -152,10 +171,12 @@ function run() {
       setTimeout(cleanup, 320);
     } else cleanup();
   };
-  const onKey = () => finish(true);
-  el.addEventListener('cancel', (e) => { e.preventDefault(); if (!locked) finish(true); }); // Esc skips like any other key
+  const onKey = () => finish('skip');
+  el.addEventListener('cancel', (e) => { e.preventDefault(); if (!locked) finish('skip'); }); // Esc skips like any other key
   // skipping is armed once the film runs (the gate's own tap must not skip it)
-  const armSkip = () => { el.addEventListener('pointerdown', () => finish(true)); addEventListener('keydown', onKey, true); };
+  const armSkip = () => { el.addEventListener('pointerdown', () => finish('skip')); addEventListener('keydown', onKey, true); };
+  // the route, from the card on: a session restored into a room / a match takes the film down at once
+  const unwatch = store.subscribe(() => { if (!done && !allowed()) finish('leave'); });
 
   const fonts = document.fonts?.load
     ? Promise.race([Promise.all(['300 40px Bender', '400 40px Bender'].map((f) => document.fonts.load(f).catch(() => null))), new Promise((r) => setTimeout(r, 1200))])
@@ -163,9 +184,10 @@ function run() {
   const pictures = preloadSprites(undefined, 3000);
   gate.then(() => Promise.all([pictures, fonts, prepareSound()])).then((res) => {
     if (done || !res) return;
+    if (!allowed()) { finish('leave'); return; }
     const sound = res[2];
     armSkip();
-    try { scene = mountAllianceIntro(el); } catch (err) { console.warn('[intro] could not start', err); finish(false); return; }
+    try { scene = mount(el); } catch (err) { console.warn('[intro] could not start', err); finish('end'); return; }
     const { from, fadeAt, to } = INTRO_SPAN;
     const lead = 0.04;
     const t0 = performance.now() + lead * 1000; // video second `from` is on screen at t0
@@ -188,7 +210,7 @@ function run() {
     const frame = () => {
       if (done) return;
       const T = from + (performance.now() - t0) / 1000;
-      if (T >= to) { finish(false); return; }
+      if (T >= to) { finish('end'); return; }
       if (T < 3.2) scene.grain();
       scene.render(Math.max(from, T));
       const fade = Math.min(1, Math.max(0, (T - fadeAt) / (to - fadeAt)));
@@ -204,14 +226,15 @@ function run() {
 /**
  * Play the film once per page load, before the title screen — also when a reload lands in the lobby; never over a
  * room or a match, never without the art pack or under reduced motion.
- * @param {{ skip?: () => boolean }} [opts]  skip() → true when it must not play
+ * @param {{ skip?: () => boolean, mount?: typeof mountAllianceIntro }} [opts]  skip() → true when it must not (or no
+ *   longer) play; mount: the scene (tests pass a stand-in)
  */
 export async function playEntryFilm(opts = {}) {
-  const { skip = () => false } = opts;
+  const { skip = () => false, mount = mountAllianceIntro } = opts;
   if (reducedMotion()) return;
   try { await data.load('assets'); } catch { return; }
   if (!hasSprites()) return;
   const allowed = () => { const r = selectRoute(store.get()); return r !== 'room' && r !== 'game' && !skip(); };
   if (!allowed()) return;
-  whenPhoneReady(allowed, run);
+  whenPhoneReady(allowed, () => run(allowed, mount));
 }
